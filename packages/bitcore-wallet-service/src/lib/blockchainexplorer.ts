@@ -5,9 +5,6 @@ import { ChainService } from './chain/index';
 const $ = require('preconditions').singleton();
 const Common = require('./common');
 const Defaults = Common.Defaults;
-let log = require('npmlog');
-log.debug = log.verbose;
-
 const PROVIDERS = {
   v8: {
     btc: {
@@ -30,7 +27,7 @@ const PROVIDERS = {
 };
 
 export function BlockChainExplorer(opts) {
-  $.checkArgument(opts);
+  $.checkArgument(opts, 'Failed state: opts undefined at <BlockChainExplorer()>');
 
   const provider = opts.provider || 'v8';
   const coin = ChainService.getChain(opts.coin || Defaults.COIN).toLowerCase();

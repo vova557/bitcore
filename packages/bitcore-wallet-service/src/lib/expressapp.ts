@@ -1,9 +1,10 @@
 import express from 'express';
 import _ from 'lodash';
-import * as log from 'npmlog';
 import 'source-map-support/register';
+import { logger, transport } from './logger';
 
 import { ClientError } from './errors/clienterror';
+import { LogMiddleware } from './middleware';
 import { WalletService } from './server';
 import { Stats } from './stats';
 
@@ -14,10 +15,6 @@ const RateLimit = require('express-rate-limit');
 const Common = require('./common');
 const rp = require('request-promise-native');
 const Defaults = Common.Defaults;
-
-log.disableColor();
-log.debug = log.verbose;
-log.level = 'verbose';
 
 export class ExpressApp {
   app: express.Express;
@@ -63,7 +60,7 @@ export class ExpressApp {
     // handle `abort` https://nodejs.org/api/http.html#http_event_abort
     this.app.use((req, res, next) => {
       req.on('abort', () => {
-        log.warn('Request aborted by the client');
+        logger.warn('Request aborted by the client');
       });
       next();
     });
@@ -88,22 +85,24 @@ export class ExpressApp {
     });
 
     if (opts.disableLogs) {
-      log.level = 'silent';
+      transport.level = 'error';
     } else {
-      const morgan = require('morgan');
-      morgan.token('walletId', function getId(req) {
-        return req.walletId ? '<' + req.walletId + '>' : '<>';
-      });
+      this.app.use(LogMiddleware());
+      // morgan.token('walletId', function getId(req) {
+      // return req.walletId ? '<' + req.walletId + '>' : '<>';
+      // });
 
-      const logFormat =
-        ':walletId :remote-addr :date[iso] ":method :url" :status :res[content-length] :response-time ":user-agent"  ';
-      const logOpts = {
-        skip(req, res) {
-          if (res.statusCode != 200) return false;
-          return req.path.indexOf('/notifications/') >= 0;
-        }
-      };
-      this.app.use(morgan(logFormat, logOpts));
+      // const logFormat =
+      // ':walletId :remote-addr :date[iso] ":method :url" :status :res[content-length] :response-time ":user-agent"  ';
+      // const logOpts = {
+      // skip(req, res) {
+      // if (res.statusCode != 200) return false;
+      // return req.path.indexOf('/notifications/') >= 0;
+      // },
+      // stream: logger.stream
+      // };
+
+      // this.app.use(morgan(logFormat, logOpts));
     }
 
     const router = express.Router();
@@ -111,7 +110,7 @@ export class ExpressApp {
     const returnError = (err, res, req) => {
       if (err instanceof ClientError) {
         const status = err.code == 'NOT_AUTHORIZED' ? 401 : 400;
-        if (!opts.disableLogs) log.info('Client Err: ' + status + ' ' + req.url + ' ' + JSON.stringify(err));
+        if (!opts.disableLogs) logger.info('Client Err: ' + status + ' ' + req.url + ' ' + JSON.stringify(err));
 
         res
           .status(status)
@@ -130,7 +129,7 @@ export class ExpressApp {
 
         const m = message || err.toString();
 
-        if (!opts.disableLogs) log.error(req.url + ' :' + code + ':' + m);
+        if (!opts.disableLogs) logger.error(req.url + ' :' + code + ':' + m);
 
         res
           .status(code || 500)
@@ -142,7 +141,7 @@ export class ExpressApp {
     };
 
     const logDeprecated = req => {
-      log.warn('DEPRECATED', req.method, req.url, '(' + req.header('x-client-version') + ')');
+      logger.warn('DEPRECATED', req.method, req.url, '(' + req.header('x-client-version') + ')');
     };
 
     const getCredentials = req => {
@@ -206,6 +205,20 @@ export class ExpressApp {
           );
         }
 
+        if (server.copayerIsSupportStaff) {
+          req.isSupportStaff = true;
+        }
+
+        if (opts.onlyMarketingStaff && !server.copayerIsMarketingStaff) {
+          return returnError(
+            new ClientError({
+              code: 'NOT_AUTHORIZED'
+            }),
+            res,
+            req
+          );
+        }
+
         // For logging
         req.walletId = server.walletId;
         req.copayerId = server.copayerId;
@@ -217,7 +230,7 @@ export class ExpressApp {
     let createWalletLimiter;
 
     if (Defaults.RateLimit.createWallet && !opts.ignoreRateLimiter) {
-      log.info(
+      logger.info(
         '',
         'Limiting wallet creation per IP: %d req/h',
         ((Defaults.RateLimit.createWallet.max / Defaults.RateLimit.createWallet.windowMs) * 60 * 60 * 1000).toFixed(2)
@@ -230,8 +243,16 @@ export class ExpressApp {
       };
     }
 
+    const ONE_MINUTE = 60;
+    // See https://support.cloudflare.com/hc/en-us/articles/115003206852-Understanding-Origin-Cache-Control
+    // Case: "▶Cache an asset with revalidation, but allow stale responses if origin server is unreachable"
+    function SetPublicCache(res: express.Response, seconds: number) {
+      res.setHeader('Cache-Control', `public, max-age=${seconds}, stale-if-error=${10 * seconds}`);
+    }
+
     // retrieve latest version of copay
     router.get('/latest-version', async (req, res) => {
+      SetPublicCache(res, 10 * ONE_MINUTE);
       try {
         res.setHeader('User-Agent', 'copay');
         var options = {
@@ -368,7 +389,9 @@ export class ExpressApp {
           includeExtendedInfo: false,
           twoStep: false,
           includeServerMessages: false,
-          tokenAddress: req.query.tokenAddress
+          tokenAddress: req.query.tokenAddress,
+          multisigContractAddress: req.query.multisigContractAddress,
+          network: req.query.network
         };
         if (req.query.includeExtendedInfo == '1') opts.includeExtendedInfo = true;
         if (req.query.twoStep == '1') opts.twoStep = true;
@@ -445,6 +468,7 @@ export class ExpressApp {
       });
     });
 
+    // DEPRECATED
     router.post('/v1/txproposals/', (req, res) => {
       const Errors = require('./errors/errordefinitions');
       const err = Errors.UPGRADE_NEEDED;
@@ -455,6 +479,7 @@ export class ExpressApp {
     router.post('/v2/txproposals/', (req, res) => {
       getServerWithAuth(req, res, server => {
         req.body.noCashAddr = true;
+        req.body.txpVersion = 3;
         server.createTx(req.body, (err, txp) => {
           if (err) return returnError(err, res, req);
           res.json(txp);
@@ -464,12 +489,165 @@ export class ExpressApp {
 
     router.post('/v3/txproposals/', (req, res) => {
       getServerWithAuth(req, res, server => {
+        req.body.txpVersion = 3;
         server.createTx(req.body, (err, txp) => {
           if (err) return returnError(err, res, req);
           res.json(txp);
         });
       });
     });
+
+    // create advertisement
+    router.post('/v1/advertisements/', (req, res) => {
+      getServerWithAuth(
+        req,
+        res,
+        {
+          onlyMarketingStaff: true
+        },
+        server => {
+          server.createAdvert(req.body, (err, advert) => {
+            if (err) {
+              return returnError(err, res, req);
+            }
+            if (advert) res.json(advert);
+          });
+        }
+      );
+    });
+
+    router.get('/v1/advertisements/', (req, res) => {
+      let server;
+      let testing = req.query.testing;
+
+      try {
+        server = getServer(req, res);
+      } catch (ex) {
+        return returnError(ex, res, req);
+      }
+
+      if (testing) {
+        server.getTestingAdverts(req.body, (err, ads) => {
+          if (err) returnError(err, res, req);
+          res.json(ads);
+        });
+      } else {
+        SetPublicCache(res, 5 * ONE_MINUTE);
+        server.getAdverts(req.body, (err, ads) => {
+          if (err) returnError(err, res, req);
+          res.json(ads);
+        });
+      }
+    });
+
+    router.get('/v1/advertisements/:adId/', (req, res) => {
+      let server;
+
+      try {
+        server = getServer(req, res);
+      } catch (ex) {
+        return returnError(ex, res, req);
+      }
+
+      let opts = { adId: req.params['adId'] };
+
+      if (req.params['adId']) {
+        server.getAdvert(opts, (err, ad) => {
+          if (err) returnError(err, res, req);
+          res.json(ad);
+        });
+      }
+    });
+
+    router.get('/v1/advertisements/country/:country', (req, res) => {
+      let server;
+      let country = req.params['country'];
+
+      let opts = { country };
+
+      try {
+        server = getServer(req, res);
+      } catch (ex) {
+        return returnError(ex, res, req);
+      }
+
+      server.getAdvertsByCountry(opts, (err, ads) => {
+        if (err) returnError(err, res, req);
+        res.json(ads);
+      });
+    });
+
+    router.post('/v1/advertisements/:adId/activate', (req, res) => {
+      let opts = { adId: req.params['adId'] };
+
+      getServerWithAuth(
+        req,
+        res,
+        {
+          onlyMarketingStaff: true
+        },
+        server => {
+          if (req.params['adId']) {
+            server.activateAdvert(opts, (err, ad) => {
+              if (err) returnError(err, res, req);
+              res.json({ advertisementId: opts.adId, message: 'advert activated' });
+            });
+          }
+        }
+      );
+    });
+
+    router.post('/v1/advertisements/:adId/deactivate', (req, res) => {
+      let opts = { adId: req.params['adId'] };
+
+      getServerWithAuth(
+        req,
+        res,
+        {
+          onlyMarketingStaff: true
+        },
+        server => {
+          if (req.params['adId']) {
+            server.deactivateAdvert(opts, (err, ad) => {
+              if (err) returnError(err, res, req);
+              res.json({ advertisementId: opts.adId, message: 'advert deactivated' });
+            });
+          }
+        }
+      );
+    });
+
+    router.delete('/v1/advertisements/:adId/', (req, res) => {
+      getServerWithAuth(
+        req,
+        res,
+        {
+          onlyMarketingStaff: true
+        },
+        server => {
+          req.body.adId = req.params['adId'];
+          server.removeAdvert(req.body, (err, removedAd) => {
+            if (err) returnError(err, res, req);
+            if (removedAd) {
+              res.json(removedAd);
+            }
+          });
+        }
+      );
+    });
+
+    /* THIS WAS NEVED ENABLED YET NOW 2020-04-07
+    router.post('/v4/txproposals/', (req, res) => {
+      getServerWithAuth(req, res, server => {
+        req.body.txpVersion = 4;
+        server.createTx(req.body, (err, txp) => {
+          if (err) return returnError(err, res, req);
+          res.json(txp);
+        });
+      });
+    });
+
+*/
 
     // DEPRECATED
     router.post('/v1/addresses/', (req, res) => {
@@ -540,10 +718,12 @@ export class ExpressApp {
 
     router.get('/v1/balance/', (req, res) => {
       getServerWithAuth(req, res, server => {
-        const opts: { coin?: string; twoStep?: boolean; tokenAddress?: string } = {};
+        const opts: { coin?: string; twoStep?: boolean; tokenAddress?: string; multisigContractAddress?: string } = {};
         if (req.query.coin) opts.coin = req.query.coin;
         if (req.query.twoStep == '1') opts.twoStep = true;
         if (req.query.tokenAddress) opts.tokenAddress = req.query.tokenAddress;
+        if (req.query.multisigContractAddress) opts.multisigContractAddress = req.query.multisigContractAddress;
+
         server.getBalance(opts, (err, balance) => {
           if (err) return returnError(err, res, req);
           res.json(balance);
@@ -554,7 +734,7 @@ export class ExpressApp {
     let estimateFeeLimiter;
 
     if (Defaults.RateLimit.estimateFee && !opts.ignoreRateLimiter) {
-      log.info(
+      logger.info(
         '',
         'Limiting estimate fee per IP: %d req/h',
         ((Defaults.RateLimit.estimateFee.max / Defaults.RateLimit.estimateFee.windowMs) * 60 * 60 * 1000).toFixed(2)
@@ -569,6 +749,7 @@ export class ExpressApp {
 
     // DEPRECATED
     router.get('/v1/feelevels/', estimateFeeLimiter, (req, res) => {
+      SetPublicCache(res, 1 * ONE_MINUTE);
       logDeprecated(req);
       const opts: { network?: string } = {};
       if (req.query.network) opts.network = req.query.network;
@@ -590,6 +771,7 @@ export class ExpressApp {
 
     router.get('/v2/feelevels/', (req, res) => {
       const opts: { coin?: string; network?: string } = {};
+      SetPublicCache(res, 1 * ONE_MINUTE);
       if (req.query.coin) opts.coin = req.query.coin;
       if (req.query.network) opts.network = req.query.network;
 
@@ -610,6 +792,28 @@ export class ExpressApp {
         try {
           const gasLimit = await server.estimateGas(req.body);
           res.json(gasLimit);
+        } catch (err) {
+          returnError(err, res, req);
+        }
+      });
+    });
+
+    router.post('/v1/ethmultisig/', (req, res) => {
+      getServerWithAuth(req, res, async server => {
+        try {
+          const multisigContractInstantiationInfo = await server.getMultisigContractInstantiationInfo(req.body);
+          res.json(multisigContractInstantiationInfo);
+        } catch (err) {
+          returnError(err, res, req);
+        }
+      });
+    });
+
+    router.post('/v1/ethmultisig/info', (req, res) => {
+      getServerWithAuth(req, res, async server => {
+        try {
+          const multisigContractInfo = await server.getMultisigContractInfo(req.body);
+          res.json(multisigContractInfo);
         } catch (err) {
           returnError(err, res, req);
         }
@@ -648,6 +852,16 @@ export class ExpressApp {
       });
     });
 
+    router.get('/v1/txcoins/', (req, res) => {
+      const txId = req.query.txId;
+      getServerWithAuth(req, res, server => {
+        server.getCoinsForTx({ txId }, (err, coins) => {
+          if (err) return returnError(err, res, req);
+          res.json(coins);
+        });
+      });
+    });
+
     router.post('/v1/broadcast_raw/', (req, res) => {
       getServerWithAuth(req, res, server => {
         server.broadcastRawTx(req.body, (err, txid) => {
@@ -658,8 +872,10 @@ export class ExpressApp {
       });
     });
 
+    // DEPRECATEED
     router.post('/v1/txproposals/:id/signatures/', (req, res) => {
       getServerWithAuth(req, res, server => {
+        req.body.maxTxpVersion = 3;
         req.body.txProposalId = req.params['id'];
         server.signTx(req.body, (err, txp) => {
           if (err) return returnError(err, res, req);
@@ -668,6 +884,37 @@ export class ExpressApp {
         });
       });
     });
+
+    // We created a new endpoint that support BCH schnorr signatues
+    // so we can safely throw the error "UPGRADE NEEDED" if an old
+    // client tries to post ECDSA signatures to a Schnorr TXP.
+    // (using the old /v1/txproposal method): if (txp.signingMethod === 'schnorr' && !opts.supportBchSchnorr) return cb(Errors.UPGRADE_NEEDED);
+    router.post('/v2/txproposals/:id/signatures/', (req, res) => {
+      getServerWithAuth(req, res, server => {
+        req.body.txProposalId = req.params['id'];
+        req.body.maxTxpVersion = 3;
+        req.body.supportBchSchnorr = true;
+        server.signTx(req.body, (err, txp) => {
+          if (err) return returnError(err, res, req);
+          res.json(txp);
+          res.end();
+        });
+      });
+    });
+
+    /* THIS WAS NEVED ENABLED YET NOW 2020-04-07 (see above)
+    router.post('/v3/txproposals/:id/signatures/', (req, res) => {
+      getServerWithAuth(req, res, server => {
+        req.body.txProposalId = req.params['id'];
+        req.body.maxTxpVersion = 4;
+        server.signTx(req.body, (err, txp) => {
+          if (err) return returnError(err, res, req);
+          res.json(txp);
+          res.end();
+        });
+      });
+    });
+    */
 
     //
     router.post('/v1/txproposals/:id/publish/', (req, res) => {
@@ -747,10 +994,12 @@ export class ExpressApp {
           limit?: number;
           includeExtendedInfo?: boolean;
           tokenAddress?: string;
+          multisigContractAddress?: string;
         } = {};
         if (req.query.skip) opts.skip = +req.query.skip;
         if (req.query.limit) opts.limit = +req.query.limit;
         if (req.query.tokenAddress) opts.tokenAddress = req.query.tokenAddress;
+        if (req.query.multisigContractAddress) opts.multisigContractAddress = req.query.multisigContractAddress;
         if (req.query.includeExtendedInfo == '1') opts.includeExtendedInfo = true;
 
         server.getTxHistory(opts, (err, txs) => {
@@ -771,13 +1020,17 @@ export class ExpressApp {
       });
     });
 
+    // Retrive stats DO NOT UPDATE THEM
+    // To update them run /updatestats
     router.get('/v1/stats/', (req, res) => {
+      SetPublicCache(res, 1 * ONE_MINUTE);
       const opts: {
         network?: string;
         coin?: string;
         from?: string;
         to?: string;
       } = {};
+
       if (req.query.network) opts.network = req.query.network;
       if (req.query.coin) opts.coin = req.query.coin;
       if (req.query.from) opts.from = req.query.from;
@@ -792,6 +1045,7 @@ export class ExpressApp {
     });
 
     router.get('/v1/version/', (req, res) => {
+      SetPublicCache(res, 1 * ONE_MINUTE);
       res.json({
         serviceVersion: WalletService.getServiceVersion()
       });
@@ -876,6 +1130,7 @@ export class ExpressApp {
     });
 
     router.get('/v1/fiatrates/:code/', (req, res) => {
+      SetPublicCache(res, 5 * ONE_MINUTE);
       let server;
       const opts = {
         code: req.params['code'],
@@ -894,6 +1149,7 @@ export class ExpressApp {
     });
 
     router.get('/v2/fiatrates/:code/', (req, res) => {
+      SetPublicCache(res, 5 * ONE_MINUTE);
       let server;
       const opts = {
         code: req.params['code'],
@@ -905,6 +1161,25 @@ export class ExpressApp {
         return returnError(ex, res, req);
       }
       server.getHistoricalRates(opts, (err, rates) => {
+        if (err) return returnError(err, res, req);
+        res.json(rates);
+      });
+    });
+
+    router.get('/v3/fiatrates/:coin/', (req, res) => {
+      SetPublicCache(res, 5 * ONE_MINUTE);
+      let server;
+      const opts = {
+        coin: req.params['coin'],
+        code: req.query.code || null,
+        ts: req.query.ts ? +req.query.ts : null
+      };
+      try {
+        server = getServer(req, res);
+      } catch (ex) {
+        return returnError(ex, res, req);
+      }
+      server.getFiatRates(opts, (err, rates) => {
         if (err) return returnError(err, res, req);
         res.json(rates);
       });
@@ -1008,10 +1283,64 @@ export class ExpressApp {
       });
     });
 
+    router.post('/v1/service/wyre/walletOrderQuotation', (req, res) => {
+      getServerWithAuth(req, res, server => {
+        server
+          .wyreWalletOrderQuotation(req)
+          .then(response => {
+            res.json(response);
+          })
+          .catch(err => {
+            if (err) return returnError(err, res, req);
+          });
+      });
+    });
+
+    router.post('/v1/service/wyre/walletOrderReservation', (req, res) => {
+      getServerWithAuth(req, res, server => {
+        server
+          .wyreWalletOrderReservation(req)
+          .then(response => {
+            res.json(response);
+          })
+          .catch(err => {
+            if (err) return returnError(err, res, req);
+          });
+      });
+    });
+
+    router.get('/v1/service/payId/:payId', (req, res) => {
+      let server;
+      const payId = req.params['payId'];
+      const opts = {
+        handle: payId.split('$')[0],
+        domain: payId.split('$')[1]
+      };
+      try {
+        server = getServer(req, res);
+      } catch (ex) {
+        return returnError(ex, res, req);
+      }
+      server
+        .discoverPayId(opts)
+        .then(response => {
+          res.json(response);
+        })
+        .catch(err => {
+          if (err) return returnError(err, res, req);
+        });
+    });
+
+    // Set no-cache by default
+    this.app.use((req, res, next) => {
+      res.setHeader('Cache-Control', 'no-store');
+      next();
+    });
+
     this.app.use(opts.basePath || '/bws/api', router);
 
     if (config.staticRoot) {
-      log.info(`Serving static files from ${config.staticRoot}`);
+      logger.debug(`Serving static files from ${config.staticRoot}`);
       this.app.use('/static', express.static(config.staticRoot));
     }
 

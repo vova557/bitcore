@@ -4,6 +4,12 @@ head-nav {
     width: 35px;
   }
 
+  a {
+    text-decoration: none;
+    font: inherit;
+    color: inherit;
+  }
+
   .search-image {
     width: 16px;
     opacity: .5;
@@ -73,7 +79,7 @@ head-nav {
         width: 748px;
         margin-top: 4px;
         margin-left: -62px;
-        padding: 9px 12px;
+        padding: 9px 55px 9px 12px;
         color: color($colors, dark-light);
         background-color: #FFF;
         border: 0;
